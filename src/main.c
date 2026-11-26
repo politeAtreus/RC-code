@@ -1,7 +1,10 @@
 /*
   STM32F411 - Joystick Sail Controller → XBee Radio Link
 
-  USART1 (XBee Radio, 115200 8N1, AP=1, AO=0):
+  RADIOMODE=0: transparent XBee UART (AP=0)
+  RADIOMODE=1: unescaped XBee API UART (AP=1, AO=0)
+
+  USART1 (XBee Radio, 115200 8N1):
       TX = PA9  → XBee DIN
       RX = PA10 ← XBee DOUT
 
@@ -9,7 +12,7 @@
       TX = PA2
       RX = PA3
       XBee RX: <telemetry line>
-      XBee API: <hex for the entire validated frame, from 7E through checksum>
+      XBee API: <full validated frame in hex> (RADIOMODE=1 only)
 
   Joystick ADC:
       X-axis = PA0 = ADC_CHANNEL_0   ← used for the rudder command
@@ -24,12 +27,24 @@
 
 /* -------------------- Config -------------------- */
 
+#ifndef RADIOMODE
+#define RADIOMODE 1
+#endif
+
+#if RADIOMODE != 0 && RADIOMODE != 1
+#error "RADIOMODE must be 0 (transparent) or 1 (API)"
+#endif
+
 #define ADC_CENTER      2048
 #define ADC_MAX         2048.0f
 #define DEADBAND        100
 #define UART_BAUD       115200U
 #define JOYSTICK_PERIOD_MS  500U
+#define TELEMETRY_LINE_SIZE 256U
+#define XBEE_TX_TIMEOUT_MS  20U
+#define GUI_TX_TIMEOUT_MS   100U
 
+#if RADIOMODE == 1
 #define XBEE_MAX_RF_PAYLOAD   256U
 #define XBEE_FRAME_HEADER    3U  /* delimiter and 16-bit length */
 #define XBEE_FRAME_OVERHEAD  (XBEE_FRAME_HEADER + 1U) /* includes checksum */
@@ -40,8 +55,6 @@
 #define XBEE_PAYLOAD_IDLE_MS 500U
 #define XBEE_AT_TIMEOUT_MS   500U
 #define XBEE_DIAGNOSTIC_MS   5000U
-#define XBEE_TX_TIMEOUT_MS   20U
-#define GUI_TX_TIMEOUT_MS    100U
 
 enum {
   XBEE_START = 0x7E,
@@ -62,6 +75,7 @@ static const uint8_t at_names[][2] = {
   [AT_VR] = {'V', 'R'}
 };
 static const XBeeAtCommand diagnostics[] = {AT_EA, AT_ER, AT_TR, AT_VR};
+#endif
 
 /* -------------------- Ring Buffer -------------------- */
 
@@ -82,15 +96,17 @@ static uint16_t           adc_center = ADC_CENTER;
 
 /* -------------------- XBee Protocol State -------------------- */
 
+static char     telemetry_line[TELEMETRY_LINE_SIZE];
+static uint16_t telemetry_used;
+static bool     telemetry_discard;
+
+#if RADIOMODE == 1
 static uint8_t  rx_frame[XBEE_RX_FRAME_SIZE];
 static uint16_t rx_frame_used;
 static uint16_t rx_frame_size;
 static uint8_t  rx_checksum;
 static uint32_t rx_last_byte;
 
-static char     telemetry_line[XBEE_MAX_RF_PAYLOAD];
-static uint16_t telemetry_used;
-static bool     telemetry_discard;
 static uint32_t telemetry_last_payload;
 
 static uint8_t  boat_address[8];          /* big-endian DH followed by DL */
@@ -105,6 +121,7 @@ static struct {
 static bool     rssi_pending;
 static uint32_t last_diagnostic;
 static size_t   diagnostic_index;
+#endif
 
 /* -------------------- Prototypes -------------------- */
 
@@ -112,10 +129,12 @@ static void     XBee_UART_Init(uint32_t baud);
 static void     Debug_UART_Init(uint32_t baud);
 static void     ADC1_Init_A0_A1(void);
 static uint16_t ADC1_ReadChannel(uint32_t channel);
-static void     XBee_ReadFrames(void);
-static void     XBee_ServiceAt(uint32_t now);
+static void     XBee_Read(void);
 static void     XBee_SendJoystick(int16_t angle);
 static void     Debug_Printf(const char *fmt, ...);
+#if RADIOMODE == 1
+static void     XBee_ServiceAt(uint32_t now);
+#endif
 
 /* -------------------- Main -------------------- */
 
@@ -140,13 +159,17 @@ int main(void)
 
   const uint32_t started = HAL_GetTick();
   uint32_t last_joystick = started - JOYSTICK_PERIOD_MS;
+#if RADIOMODE == 1
   last_address_query = started - XBEE_AT_TIMEOUT_MS;
+#endif
 
   while (1)
   {
-    XBee_ReadFrames();
+    XBee_Read();
     const uint32_t now = HAL_GetTick();
+#if RADIOMODE == 1
     XBee_ServiceAt(now);
+#endif
 
     /* Keep servicing radio RX between joystick updates. */
     if (now - last_joystick < JOYSTICK_PERIOD_MS)
@@ -180,8 +203,7 @@ int main(void)
     int16_t angle = (int16_t)angle_f;
 
     /* --- send joystick data to XBee --- */
-    if (boat_address_parts == 2U)
-      XBee_SendJoystick(angle);
+    XBee_SendJoystick(angle);
 
     /* --- debug joystick output --- */
     Debug_Printf("x_raw=%u  offset=%d  angle=%d\r\n",
@@ -216,6 +238,37 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *h)
   }
 }
 
+/* -------------------- Telemetry Lines -------------------- */
+
+static void XBee_ResetTelemetry(void)
+{
+  telemetry_used = 0U;
+  telemetry_discard = false;
+}
+
+static void XBee_ConsumeTelemetryByte(uint8_t byte)
+{
+  if (byte == '\n') {
+    if (!telemetry_discard && telemetry_used != 0U)
+      Debug_Printf("XBee RX: %.*s\r\n", (int)telemetry_used, telemetry_line);
+    XBee_ResetTelemetry();
+  } else if (byte != '\r' && !telemetry_discard) {
+    if (byte == '\0' || telemetry_used == sizeof(telemetry_line))
+      telemetry_discard = true;
+    else
+      telemetry_line[telemetry_used++] = (char)byte;
+  }
+}
+
+static void XBee_ResetReceive(void)
+{
+#if RADIOMODE == 1
+  rx_frame_used = 0U;
+#endif
+  XBee_ResetTelemetry();
+}
+
+#if RADIOMODE == 1
 /* -------------------- XBee API Transmission -------------------- */
 
 static uint8_t XBee_NextFrameId(void)
@@ -238,26 +291,6 @@ static bool XBee_SendFrame(uint8_t *wire, uint16_t length)
 
   return HAL_UART_Transmit(&huart1, wire, length + XBEE_FRAME_OVERHEAD,
                            XBEE_TX_TIMEOUT_MS) == HAL_OK;
-}
-
-static void XBee_SendJoystick(int16_t angle)
-{
-  char msg[32];
-  const int length = snprintf(msg, sizeof(msg), "{sa:0,ra:%d}\r\n", angle);
-  if (length <= 0 || (size_t)length >= sizeof(msg))
-    return;
-
-  uint8_t wire[XBEE_FRAME_OVERHEAD + XBEE_TX_HEADER + sizeof(msg)];
-  uint8_t *data = &wire[XBEE_FRAME_HEADER];
-  data[0] = XBEE_TX_REQUEST;
-  data[1] = XBee_NextFrameId();
-  memcpy(&data[2], boat_address, sizeof(boat_address));
-  data[10] = 0xFFU;
-  data[11] = 0xFEU;  /* use the 64-bit destination */
-  data[12] = 0U;    /* default broadcast radius */
-  data[13] = 0U;    /* use the radio's TO setting */
-  memcpy(&data[XBEE_TX_HEADER], msg, (size_t)length);
-  XBee_SendFrame(wire, XBEE_TX_HEADER + (uint16_t)length);
 }
 
 /* -------------------- Local XBee AT Requests -------------------- */
@@ -332,31 +365,14 @@ static void XBee_HandleAtResponse(const uint8_t *data, uint16_t length, uint32_t
 
 /* -------------------- XBee API Reception -------------------- */
 
-static void XBee_ResetTelemetry(void)
-{
-  telemetry_used = 0U;
-  telemetry_discard = false;
-}
-
 static void XBee_ForwardTelemetry(const uint8_t *data, uint16_t length, uint32_t now)
 {
   if (now - telemetry_last_payload >= XBEE_PAYLOAD_IDLE_MS)
     XBee_ResetTelemetry();
   telemetry_last_payload = now;
 
-  for (uint16_t i = 0U; i < length; ++i) {
-    const uint8_t byte = data[i];
-    if (byte == '\n') {
-      if (!telemetry_discard && telemetry_used != 0U)
-        Debug_Printf("XBee RX: %.*s\r\n", (int)telemetry_used, telemetry_line);
-      XBee_ResetTelemetry();
-    } else if (byte != '\r' && !telemetry_discard) {
-      if (byte == '\0' || telemetry_used == sizeof(telemetry_line))
-        telemetry_discard = true;
-      else
-        telemetry_line[telemetry_used++] = (char)byte;
-    }
-  }
+  for (uint16_t i = 0U; i < length; ++i)
+    XBee_ConsumeTelemetryByte(data[i]);
 }
 
 #define GUI_API_PREFIX "XBee API: "
@@ -412,13 +428,7 @@ static void XBee_HandleFrame(void)
   XBee_ForwardFrame();
 }
 
-static void XBee_ResetReceive(void)
-{
-  rx_frame_used = 0U;
-  XBee_ResetTelemetry();
-}
-
-static void XBee_ConsumeByte(uint8_t byte)
+static void XBee_ConsumeApiByte(uint8_t byte)
 {
   if (rx_frame_used == 0U && byte != XBEE_START)
     return;
@@ -445,8 +455,40 @@ static void XBee_ConsumeByte(uint8_t byte)
     }
   }
 }
+#endif
 
-static void XBee_ReadFrames(void)
+/* -------------------- XBee Transport -------------------- */
+
+static void XBee_SendJoystick(int16_t angle)
+{
+#if RADIOMODE == 1
+  if (boat_address_parts != 2U)
+    return;
+#endif
+
+  char msg[32];
+  const int length = snprintf(msg, sizeof(msg), "{sa:0,ra:%d}\r\n", angle);
+  if (length <= 0 || (size_t)length >= sizeof(msg))
+    return;
+
+#if RADIOMODE == 1
+  uint8_t wire[XBEE_FRAME_OVERHEAD + XBEE_TX_HEADER + sizeof(msg)];
+  uint8_t *data = &wire[XBEE_FRAME_HEADER];
+  data[0] = XBEE_TX_REQUEST;
+  data[1] = XBee_NextFrameId();
+  memcpy(&data[2], boat_address, sizeof(boat_address));
+  data[10] = 0xFFU;
+  data[11] = 0xFEU;  /* use the 64-bit destination */
+  data[12] = 0U;    /* default broadcast radius */
+  data[13] = 0U;    /* use the radio's TO setting */
+  memcpy(&data[XBEE_TX_HEADER], msg, (size_t)length);
+  XBee_SendFrame(wire, XBEE_TX_HEADER + (uint16_t)length);
+#else
+  HAL_UART_Transmit(&huart1, (uint8_t *)msg, (uint16_t)length, XBEE_TX_TIMEOUT_MS);
+#endif
+}
+
+static void XBee_Read(void)
 {
   if (ring_gap) {
     HAL_NVIC_DisableIRQ(USART1_IRQn);
@@ -460,15 +502,21 @@ static void XBee_ReadFrames(void)
     XBee_ResetReceive();
   }
 
+#if RADIOMODE == 1
   if (rx_frame_used != 0U && HAL_GetTick() - rx_last_byte >= XBEE_FRAME_IDLE_MS)
     XBee_ResetReceive();
+#endif
 
   /* Take a snapshot so a sustained burst cannot keep us in this loop. */
   const uint16_t head = ring_head;
   while (ring_tail != head && !ring_gap) {
     const uint8_t byte = ring_buf[ring_tail];
     ring_tail = (ring_tail + 1U) % RX_RING_SIZE;
-    XBee_ConsumeByte(byte);
+#if RADIOMODE == 1
+    XBee_ConsumeApiByte(byte);
+#else
+    XBee_ConsumeTelemetryByte(byte);
+#endif
   }
 }
 
